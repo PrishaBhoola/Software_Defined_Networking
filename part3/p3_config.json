@@ -1,0 +1,81 @@
+{
+  "hosts": [
+    {
+      "name": "h1",
+      "ip": "10.0.12.2",
+      "mac": "00:00:00:00:01:02",
+      "switch": "r1",
+      "connected_subnet": "10.0.12.0/24"
+    },
+    {
+      "name": "h2",
+      "ip": "10.0.67.2",
+      "mac": "00:00:00:00:06:02",
+      "switch": "r6",
+      "connected_subnet": "10.0.67.0/24"
+    }
+  ],
+
+  "switches": [
+    {
+      "name": "r1",
+      "dpid": 1,
+      "interfaces": [
+        { "name": "r1-eth1", "ip": "10.0.12.1", "mac": "00:00:00:00:01:01", "subnet": "10.0.12.0/24", "neighbor": "h1" },
+        { "name": "r1-eth2", "ip": "10.0.13.1", "mac": "00:00:00:00:01:02", "subnet": "10.0.13.0/24", "neighbor": "r2" },
+        { "name": "r1-eth3", "ip": "10.0.14.1", "mac": "00:00:00:00:01:03", "subnet": "10.0.14.0/24", "neighbor": "r4" }
+      ]
+    },
+    {
+      "name": "r2",
+      "dpid": 2,
+      "interfaces": [
+        { "name": "r2-eth1", "ip": "10.0.13.2", "mac": "00:00:00:00:02:01", "subnet": "10.0.13.0/24", "neighbor": "r1" },
+        { "name": "r2-eth2", "ip": "10.0.23.1", "mac": "00:00:00:00:02:02", "subnet": "10.0.23.0/24", "neighbor": "r3" }
+      ]
+    },
+    {
+      "name": "r3",
+      "dpid": 3,
+      "interfaces": [
+        { "name": "r3-eth1", "ip": "10.0.23.2", "mac": "00:00:00:00:03:01", "subnet": "10.0.23.0/24", "neighbor": "r2" },
+        { "name": "r3-eth2", "ip": "10.0.36.1", "mac": "00:00:00:00:03:02", "subnet": "10.0.36.0/24", "neighbor": "r6" }
+      ]
+    },
+    {
+      "name": "r4",
+      "dpid": 4,
+      "interfaces": [
+        { "name": "r4-eth1", "ip": "10.0.14.2", "mac": "00:00:00:00:04:01", "subnet": "10.0.14.0/24", "neighbor": "r1" },
+        { "name": "r4-eth2", "ip": "10.0.45.1", "mac": "00:00:00:00:04:02", "subnet": "10.0.45.0/24", "neighbor": "r5" }
+      ]
+    },
+    {
+      "name": "r5",
+      "dpid": 5,
+      "interfaces": [
+        { "name": "r5-eth1", "ip": "10.0.45.2", "mac": "00:00:00:00:05:01", "subnet": "10.0.45.0/24", "neighbor": "r4" },
+        { "name": "r5-eth2", "ip": "10.0.56.1", "mac": "00:00:00:00:05:02", "subnet": "10.0.56.0/24", "neighbor": "r6" }
+      ]
+    },
+    {
+      "name": "r6",
+      "dpid": 6,
+      "interfaces": [
+        { "name": "r6-eth1", "ip": "10.0.36.2", "mac": "00:00:00:00:06:01", "subnet": "10.0.36.0/24", "neighbor": "r3" },
+        { "name": "r6-eth2", "ip": "10.0.56.2", "mac": "00:00:00:00:06:02", "subnet": "10.0.56.0/24", "neighbor": "r5" },
+        { "name": "r6-eth3", "ip": "10.0.67.1", "mac": "00:00:00:00:06:03", "subnet": "10.0.67.0/24", "neighbor": "h2" }
+      ]
+    }
+  ],
+
+  "links": [
+    { "src": "r1", "dst": "r2", "cost": 10},
+    { "src": "r2", "dst": "r3", "cost": 20 },
+    { "src": "r3", "dst": "r6", "cost": 10 },
+    { "src": "r6", "dst": "r5", "cost": 10 },
+    { "src": "r5", "dst": "r4", "cost": 20 },
+    { "src": "r4", "dst": "r1", "cost": 10 }
+  ]
+}
+
