@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-
-"""
-COMBINED Shortest Path Controller for Part 2
-All modules in one file for easy deployment
-Fixed ECMP implementation for proper load balancing
-"""
-
 import json
 import sys
 import os
@@ -20,7 +12,7 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
-from ryu.lib.packet import ether_types
+from ryu.lib.packet import ether_types, ipv4, tcp
 
 
 # ===============================
@@ -55,16 +47,6 @@ class NetworkGraph:
     def _build_port_mapping(self):
         """FIXED port mapping based on p2_topo.py link creation order"""
         port_map = {}
-
-        # Based on the exact order in p2_topo.py:
-        # 1. h1 -> s1 (port 1 on s1)
-        # 2. h2 -> s6 (port 1 on s6)  
-        # 3. s1 -> s2 (port 2 on s1, port 1 on s2)
-        # 4. s1 -> s3 (port 3 on s1, port 1 on s3)
-        # 5. s2 -> s4 (port 2 on s2, port 1 on s4)
-        # 6. s3 -> s5 (port 2 on s3, port 1 on s5)
-        # 7. s4 -> s6 (port 2 on s4, port 2 on s6)
-        # 8. s5 -> s6 (port 2 on s5, port 3 on s6)
 
         port_map['s1'] = {'h1': 1, 's2': 2, 's3': 3}
         port_map['s2'] = {'s1': 1, 's4': 2}
@@ -166,16 +148,16 @@ class DijkstraPathFinder:
 
 
 # ===============================
-# MAIN CONTROLLER  
+# MAIN CONTROLLER WITH TCP PORT AWARENESS
 # ===============================
 
-class CombinedShortestPathController(app_manager.RyuApp):
-    """Combined controller with all modules included"""
+class FixedShortestPathController(app_manager.RyuApp):
+    """Fixed controller that properly handles parallel TCP connections"""
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(CombinedShortestPathController, self).__init__(*args, **kwargs)
+        super(FixedShortestPathController, self).__init__(*args, **kwargs)
 
         # Load configuration
         self.config = self.load_config()
@@ -188,15 +170,15 @@ class CombinedShortestPathController(app_manager.RyuApp):
         # MAC learning table: {dpid: {mac: port}}
         self.mac_to_port = {}
 
-        # IMPROVED ECMP tracking
+        # ENHANCED ECMP tracking - now aware of TCP ports
         self.flow_paths = {}  # {flow_key: path}
-        self.path_counter = 0  # Round-robin counter for better distribution
-        self.active_flows = defaultdict(int)  # Track flows per path
+        self.path_counter = 0  # Round-robin counter
+        self.tcp_connection_counter = 0  # Counter for TCP connections
 
         # Store datapaths for flow installation
         self.datapaths = {}
 
-        self.logger.info("Combined Shortest Path Controller initialized")
+        self.logger.info("Fixed Shortest Path Controller initialized")
         self.logger.info(f"ECMP enabled: {self.ecmp_enabled}")
 
     def load_config(self):
@@ -247,7 +229,7 @@ class CombinedShortestPathController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """Handle packet-in events"""
+        """Handle packet-in events with TCP port awareness"""
         msg = ev.msg
         datapath = msg.datapath
         in_port = msg.match['in_port']
@@ -267,7 +249,18 @@ class CombinedShortestPathController(app_manager.RyuApp):
         if known_dpid is None:
             self.mac_to_port[dpid][src_mac] = in_port
 
-        self.logger.info(f"Packet from {src_mac} to {dst_mac} at switch {dpid} port {in_port}")
+        # Extract TCP port information if available
+        tcp_src_port = None
+        tcp_dst_port = None
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+
+        if ip_pkt and tcp_pkt:
+            tcp_src_port = tcp_pkt.src_port
+            tcp_dst_port = tcp_pkt.dst_port
+            self.logger.info(f"TCP packet: {src_mac}:{tcp_src_port} -> {dst_mac}:{tcp_dst_port} at switch {dpid}")
+        else:
+            self.logger.info(f"Non-TCP packet: {src_mac} -> {dst_mac} at switch {dpid}")
 
         # Handle broadcast/multicast
         if dst_mac.startswith("ff:ff:ff:ff:ff:ff") or dst_mac.startswith("01:"):
@@ -291,10 +284,11 @@ class CombinedShortestPathController(app_manager.RyuApp):
             self.send_packet_out(datapath, msg, dst_port)
             return
 
-        # Find path with improved ECMP
+        # Find path with TCP-aware ECMP
         if self.ecmp_enabled:
             paths = self.path_finder.find_all_shortest_paths(src_switch, dst_switch)
-            chosen_path = self.improved_select_path_for_flow(src_mac, dst_mac, paths)
+            chosen_path = self.tcp_aware_select_path_for_flow(
+                src_mac, dst_mac, tcp_src_port, tcp_dst_port, paths)
         else:
             chosen_path = self.path_finder.find_shortest_path(src_switch, dst_switch)
 
@@ -306,7 +300,7 @@ class CombinedShortestPathController(app_manager.RyuApp):
         self.logger.info(f"Chosen path: {' -> '.join(chosen_path)}")
 
         # Install flows along the path
-        self.install_path_flows(chosen_path, src_mac, dst_mac, dst_port)
+        self.install_path_flows(chosen_path, src_mac, dst_mac, tcp_src_port, tcp_dst_port, dst_port)
 
         # Forward the packet
         next_port = self.get_next_hop_port(dpid, chosen_path)
@@ -316,29 +310,32 @@ class CombinedShortestPathController(app_manager.RyuApp):
             self.logger.error(f"Cannot determine next hop port for {dpid} in path {chosen_path}")
             self.flood_packet(datapath, msg, in_port)
 
-    def improved_select_path_for_flow(self, src_mac, dst_mac, paths):
-        """IMPROVED path selection for better load balancing"""
+    def tcp_aware_select_path_for_flow(self, src_mac, dst_mac, tcp_src_port, tcp_dst_port, paths):
+        """TCP-aware path selection for proper parallel connection handling"""
         if not paths:
             return []
 
         if len(paths) == 1:
             return paths[0]
 
-        # Create flow key based on MAC addresses
-        flow_key = f"{src_mac}-{dst_mac}"
+        # Create enhanced flow key that includes TCP ports
+        if tcp_src_port is not None and tcp_dst_port is not None:
+            flow_key = f"{src_mac}:{tcp_src_port}-{dst_mac}:{tcp_dst_port}"
+        else:
+            # For non-TCP traffic, use MAC addresses + connection counter
+            self.tcp_connection_counter += 1
+            flow_key = f"{src_mac}-{dst_mac}-{self.tcp_connection_counter}"
 
         if flow_key not in self.flow_paths:
             if self.ecmp_enabled:
-                # STRATEGY: Round-robin for better distribution
-                # This ensures parallel flows are distributed across paths
+                # ENHANCED: Round-robin with TCP port awareness
                 chosen_path = paths[self.path_counter % len(paths)]
                 self.path_counter += 1
 
                 self.flow_paths[flow_key] = chosen_path
-                self.active_flows[str(chosen_path)] += 1
 
-                self.logger.info(f"ECMP round-robin selected path #{(self.path_counter-1) % len(paths)} "
-                               f"for {flow_key}: {' -> '.join(chosen_path)}")
+                self.logger.info(f"ECMP selected path #{(self.path_counter-1) % len(paths)} "
+                               f"for flow {flow_key}: {' -> '.join(chosen_path)}")
             else:
                 # No ECMP - use first path
                 chosen_path = paths[0]
@@ -346,8 +343,8 @@ class CombinedShortestPathController(app_manager.RyuApp):
 
         return self.flow_paths[flow_key]
 
-    def install_path_flows(self, path, src_mac, dst_mac, dst_port):
-        """Install flow rules along the path"""
+    def install_path_flows(self, path, src_mac, dst_mac, tcp_src_port, tcp_dst_port, dst_port):
+        """Install flow rules along the path with TCP port matching"""
         for i, node in enumerate(path):
             dpid = self.node_to_dpid(node)
             if dpid not in self.datapaths:
@@ -366,16 +363,29 @@ class CombinedShortestPathController(app_manager.RyuApp):
                 out_port = self.network_graph.get_port_between_nodes(node, next_node)
 
             if out_port is not None:
-                # IMPORTANT: Use src+dst match for better flow granularity
-                match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
+                # ENHANCED: Use TCP port matching when available for better flow granularity
+                if tcp_src_port is not None and tcp_dst_port is not None:
+                    match = parser.OFPMatch(
+                        eth_type=ether_types.ETH_TYPE_IP,
+                        ip_proto=6,  # TCP
+                        tcp_src=tcp_src_port,
+                        tcp_dst=tcp_dst_port,
+                        eth_src=src_mac,
+                        eth_dst=dst_mac
+                    )
+                    flow_id = f"{src_mac}:{tcp_src_port}->{dst_mac}:{tcp_dst_port}"
+                else:
+                    # Fallback to MAC-only matching
+                    match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
+                    flow_id = f"{src_mac}->{dst_mac}"
+
                 actions = [parser.OFPActionOutput(out_port)]
 
-                # Use higher priority and shorter timeout for better responsiveness
-                self.add_flow(datapath, 100, match, actions, idle_timeout=10)
-                self.logger.info(f"Installed flow at {node}: {src_mac}->{dst_mac} -> port {out_port}")
+                # Use high priority and moderate timeout
+                self.add_flow(datapath, 200, match, actions, idle_timeout=15)
+                self.logger.info(f"Installed flow at {node}: {flow_id} -> port {out_port}")
             else:
-                self.logger.error(f"Cannot determine output port for {node} -> "
-                                f"{path[i+1] if i < len(path)-1 else 'host'}")
+                self.logger.error(f"Cannot determine output port for {node}")
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0):
         """Add flow entry to switch"""
@@ -432,7 +442,6 @@ class CombinedShortestPathController(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                  in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
-        self.logger.debug(f"Flooded packet at switch {format(datapath.id, 'd').zfill(16)}")
 
     def send_packet_out(self, datapath, msg, out_port):
         """Send packet out specific port"""
@@ -445,4 +454,3 @@ class CombinedShortestPathController(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                  in_port=msg.match['in_port'], actions=actions, data=data)
         datapath.send_msg(out)
-        self.logger.debug(f"Sent packet out port {out_port}")
