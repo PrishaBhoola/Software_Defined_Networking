@@ -41,8 +41,7 @@ class L3RouterController(app_manager.RyuApp):
     def _load_config(self, config_path_str):
         """
         Loads and parses the network configuration file.
-        This builds the controller's view of the network, including IP/MAC mappings,
-        switch port connections, and the weighted graph for path calculation.
+        Dynamically builds port_map and graph from config.
         """
         try:
             full_path = os.path.join(os.path.dirname(__file__), config_path_str)
@@ -53,33 +52,34 @@ class L3RouterController(app_manager.RyuApp):
             self.logger.error("Failed to load config file: %s", e)
             return
 
-        # Static port mapping based on the p3_topo-2.py script
-        self.port_map = {
-            's1': {'h1': 1, 's2': 2, 's4': 3},
-            's2': {'s1': 1, 's3': 2},
-            's3': {'s2': 1, 's6': 2},
-            's4': {'s1': 1, 's5': 2},
-            's5': {'s4': 1, 's6': 2},  # BUG FIX: Corrected port mapping for s5
-            's6': {'s3': 1, 's5': 2, 'h2': 3},
-        }
-
         # Build IP-to-MAC mapping from hosts and switch interfaces
-        for host in config['hosts']:
-            self.ip_to_mac[host['ip']] = host['mac']
-            self.ip_to_location[host['ip']] = (host['switch'], self.port_map[host['switch']][host['name']])
+        self.ip_to_mac = {}
+        self.ip_to_location = {}
+        self.port_map = {}
+        self.graph = {}
 
+        # Build port_map from switches and their interfaces
         for switch in config['switches']:
             switch_name = switch['name']
-            self.graph.setdefault(switch_name, {})
-            # Note: There's a typo "intesfaces" and "neighbos" in the provided config file
+            self.port_map[switch_name] = {}
             interfaces_key = "intesfaces" if "intesfaces" in switch else "interfaces"
-            for iface in switch[interfaces_key]:
+            for idx, iface in enumerate(switch[interfaces_key], start=1):
+                neighbor_key = "neighbos" if "neighbos" in iface else "neighbor"
+                neighbor_name = iface[neighbor_key]
+                self.port_map[switch_name][neighbor_name] = idx
                 self.ip_to_mac[iface['ip']] = iface['mac']
 
-        # Build graph for Dijkstra's algorithm from links
-        # Note: There's a typo "ssc" in the provided config file
+        # Build ip_to_location for hosts
+        for host in config['hosts']:
+            self.ip_to_mac[host['ip']] = host['mac']
+            switch = host['switch']
+            host_name = host['name']
+            port = self.port_map[switch][host_name]
+            self.ip_to_location[host['ip']] = (switch, port)
+
+        # Build graph from links
         for link in config['links']:
-            src_switch = link.get('src', link.get('ssc')) # Handle typo 'ssc'
+            src_switch = link.get('src', link.get('ssc'))
             dst_switch = link['dst']
             cost = link['cost']
             self.graph.setdefault(src_switch, {})[dst_switch] = cost
@@ -140,18 +140,58 @@ class L3RouterController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Handle new switch connections and install table-miss flow entry."""
+        """Handle new switch connections and install table-miss flow entry and proactive L3 flows."""
         datapath = ev.msg.datapath
         dpid = datapath.id
         self.datapaths[dpid] = datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
+        # Table-miss entry
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
         self.logger.info("Switch DPID=%d connected and table-miss entry installed.", dpid)
+
+        # Proactive L3 flow installation for all host IPs
+        switch_name = f's{dpid}'
+        for dst_ip, (dst_switch, dst_port) in self.ip_to_location.items():
+            path = self._find_shortest_path(switch_name, dst_switch)
+            if not path:
+                continue
+
+            # If this switch is in the path, install the flow
+            if switch_name in path:
+                idx = path.index(switch_name)
+                if idx == len(path) - 1:
+                    # Last switch: output to host
+                    gateway_ip = self._get_interface_ip(switch_name, dst_port)
+                    if gateway_ip is None:
+                        continue
+                    match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_dst=dst_ip)
+                    actions = [
+                        parser.OFPActionSetField(eth_src=self.ip_to_mac[gateway_ip]),
+                        parser.OFPActionSetField(eth_dst=self.ip_to_mac[dst_ip]),
+                        parser.OFPActionDecNwTtl(),
+                        parser.OFPActionOutput(dst_port)
+                    ]
+                    self.add_flow(datapath, 10, match, actions, idle_timeout=0)
+                else:
+                    # Intermediate switch: output to next switch
+                    next_s = path[idx + 1]
+                    out_port = self.port_map[switch_name][next_s]
+                    src_mac_for_hop = self.ip_to_mac[self._get_interface_ip(switch_name, out_port)]
+                    next_hop_in_port = self.port_map[next_s][switch_name]
+                    dst_mac_for_hop = self.ip_to_mac[self._get_interface_ip(next_s, next_hop_in_port)]
+                    match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_dst=dst_ip)
+                    actions = [
+                        parser.OFPActionSetField(eth_src=src_mac_for_hop),
+                        parser.OFPActionSetField(eth_dst=dst_mac_for_hop),
+                        parser.OFPActionDecNwTtl(),
+                        parser.OFPActionOutput(out_port)
+                    ]
+                    self.add_flow(datapath, 10, match, actions, idle_timeout=0)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
